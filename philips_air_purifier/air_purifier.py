@@ -22,30 +22,81 @@ PHILIPS_ERROR_CODES = {
     49411: 'Pre-filter and wick cleaning alert'
 }
 
+MAPPER = [
+    (('pwr', 'air', 'power'), ['0', 'off', '1', 'on']),
+    (('pm25', 'air', 'pm_2_5'), []),
+    (('rh', 'air', 'humidity'), []),
+    (('rhset', 'air', 'target_humidity'), []),
+    (('iaql', 'air', 'allergen_index'), []),
+    (('temp', 'air', 'temperature'), []),
+    (('func', 'air', 'function'), ['P', 'purification', 'PH', 'purification_and_humidification']),
+    (('mode', 'air', 'mode'), ['P', 'auto', 'A', 'allergen', 'S', 'sleep', 'M', 'manual', 'B', 'bacteria', 'N', 'night']),
+    (('om', 'air', 'fan_speed'), ['s', 'silent', 't', 'turbo']),
+    (('aqil', 'air', 'brightness'), []),
+    (('uil', 'air', 'ui_light'), ['0', 'off', '1', 'on']),
+    (('ddp', 'air', 'ui_index'), ['0', 'allergen_index', '1', 'pm_2_5']),
+    (('wl', 'air', 'water_level'), []),
+    (('cl', 'air', 'child_lock'), []),
+    (('dt', 'air', 'timer_hours'), []),
+    (('dtrs', 'air', 'timer_minutes'), []),
+    (('wicksts', 'filter', 'wick_filter_life'), []),
+    (('fltsts0', 'filter', 'pre_filter_life'), []),
+    (('fltsts1', 'filter', 'hepa_filter_life'), []),
+    (('fltsts2', 'filter', 'carbon_filter_life'), []),
+]
 
 class AirPurifier:
     def __init__(self, ip):
         self.api_endpoints = {x: PHILIPS_API_ENDPOINTS[x].format(ip) for x in PHILIPS_API_ENDPOINTS}
-        self.session_key = b''
+        self._mapf = {}
+        self._mapr = {}
+        for m in MAPPER:
+            _mapf = {'endpoint': m[0][1], 'key': m[0][0], 'mapf': {}, 'mapr': {}}
+            _mapr = {'name': m[0][2], 'mapf': {}, 'mapr': {}}
+            for a, b in zip(m[1][::2], m[1][1::2]):
+                _mapf['mapr'][a] = b
+                _mapf['mapf'][b] = a
+                _mapr['mapr'][a] = b
+                _mapr['mapf'][b] = a
+            self._mapf[m[0][2]] = _mapf
+            self._mapr[m[0][0]] = _mapr
         self._set_session_key()
 
-    def _api_put(self, endpoint, data, encrypted_data=True):
-        data = data if encrypted_data else json.dumps(data)
+    def _api_put(self, endpoint, obj, encrypt=True, retry=True):
+        data = self._encrypt(obj) if encrypt else json.dumps(obj)
         r = requests.put(self.api_endpoints[endpoint], data=data)
-        r.raise_for_status()
-        return r.text if encrypted_data else r.json()
+        if r.status_code == 400 and retry:
+            self._set_session_key()
+            return self._api_put(endpoint, obj, encrypt, retry=False)
 
-    def _api_get(self, endpoint):
+        r.raise_for_status()
+        return r.text if encrypt else r.json()
+
+    def _api_get(self, endpoint, field=None, decrypt=True, retry=True):
         r = requests.get(self.api_endpoints[endpoint])
         r.raise_for_status()
-        return r.text
+        if not decrypt:
+            return r.text
+
+        try:
+            obj = self._decrypt(r.text)
+            if field:
+                return obj.get(field)
+            else:
+                return obj
+        except Exception as e:
+            if retry:
+                self._set_session_key()
+                return self._api_get(endpoint, field, decrypt, retry=False)
+            else:
+                raise e
 
     def _set_session_key(self):
         kex = KeyExchange()
         resp = self._api_put('security', {'diffie': kex.get_public_key()}, False)
         tmp_key = kex.get_exchanged_key(resp['hellman'])
         dec = Decrypter(AESModeOfOperationCBC(tmp_key))
-        self.session_key += dec.feed(bytes.fromhex(resp['key']))
+        self.session_key = dec.feed(bytes.fromhex(resp['key']))
         self.session_key += dec.feed()
 
     def _decrypt(self, encrypted_message):
@@ -61,135 +112,135 @@ class AirPurifier:
         enc_message += enc.feed()
         return b64encode(enc_message)
 
+    def get(self, field):
+        if field in self._mapf:
+            m = self._mapf[field]
+            value = self._api_get(m['endpoint'], m['key'])
+            return m['mapr'][value] if value in m['mapr'] else value
+        else:
+            obj = self._api_get(field)
+            ret = {}
+            for k, v in obj.items():
+                if k in self._mapr:
+                    _mapr = self._mapr[k]
+                    k = _mapr['name']
+                    if v in _mapr['mapr']:
+                        v = _mapr['mapr'][v]
+
+                ret[k] = v
+            return ret
+
+    def set(self, field, value):
+        m = self._mapf[field]
+        if value in m['mapf']:
+            value = m['mapf'][value]
+        self._api_put(m['endpoint'], {m['key']: value})
+        # for chaining
+        return self
+
+    def ensure(self, field, value):
+        current = self.get(field)
+        return self if value == current else self.set(field, value)
+
     def is_powered_on(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('pwr') == '1'
+        return self._api_get('air', 'pwr') == '1'
 
     def is_locked(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('cl')
+        return self._api_get('air', 'cl')
 
     def is_humidifier_enabled(self):
-        data = self._decrypt(self._api_get('air'))
-        return 'H' in data.get('func')
+        return 'H' in self._api_get('air', 'func')
 
     def is_display_on(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('uil') == '1'
+        return self._api_get('air', 'uil') == '1'
 
     def get_temperature(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('temp')
+        return self._api_get('air', 'temp')
 
     def get_humidity(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('rh')
+        return self._api_get('air', 'rh')
 
     def get_desired_humidity(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('rhset')
+        return self._api_get('air', 'rhset')
 
     def get_pm25_level(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('pm25')
+        return self._api_get('air', 'pm25')
 
     def get_allergen_index(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('iaql')
+        return self._api_get('air', 'iaql')
 
     def get_brightness(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('aqil')
+        return self._api_get('air', 'aqil')
 
     def get_error_code(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('err')
+        return self._api_get('air', 'err')
 
     def get_water_level(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('wl')
+        return self._api_get('air', 'wl')
 
     def get_fan_speed(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('om')
+        return self._api_get('air', 'om')
 
     def get_mode(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('mode')
+        return self._api_get('air', 'mode')
 
     def get_timer(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('dtrs')
+        return self._api_get('air', 'dtrs') / 60.0
 
     def get_display_mode(self):
-        data = self._decrypt(self._api_get('air'))
-        return data.get('ddp')
+        return self._api_get('air', 'ddp')
 
     def power_on(self):
         if not self.is_powered_on():
-            data = {'pwr': '1'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'pwr': '1'})
 
     def power_off(self):
         if self.is_powered_on():
-            data = {'pwr': '0'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'pwr': '0'})
 
     def turn_display_on(self):
         if not self.is_display_on():
-            data = {'uil': '1'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'uil': '1'})
 
     def turn_display_off(self):
         if self.is_display_on():
-            data = {'uil': '0'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'uil': '0'})
 
     def lock(self):
         if not self.is_locked():
-            data = {'cl': True}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'cl': True})
 
     def unlock(self):
         if self.is_locked():
-            data = {'cl': False}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'cl': False})
 
     def enable_humidifier(self):
         if not self.is_humidifier_enabled():
-            data = {'func': 'PH'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'func': 'PH'})
 
     def disable_humidifier(self):
         if self.is_humidifier_enabled():
-            data = {'func': 'P'}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'func': 'P'})
 
     def set_desired_humidity(self, humidity):
         if humidity != self.get_desired_humidity():
-            data = {'rhset': humidity}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'rhset': humidity})
 
     def set_brightness(self, brightness):
         if brightness != self.get_brightness():
-            data = {'aqil': brightness}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'aqil': brightness})
 
     def set_fan_speed(self, fan_speed):
         if fan_speed != self.get_fan_speed():
-            data = {'om': fan_speed}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'om': fan_speed})
 
     def set_mode(self, mode):
         if mode != self.get_mode():
-            data = {'mode': mode}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'mode': mode})
 
     def set_timer(self, time):
-        data = {'dt': time}
-        self._api_put('air', self._encrypt(data))
+        self._api_put('air', {'dt': time})
 
     def set_display_mode(self, mode):
         if mode != self.get_display_mode():
-            data = {'ddp': mode}
-            self._api_put('air', self._encrypt(data))
+            self._api_put('air', {'ddp': mode})
